@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# restore.sh — restore the original (unmodified) app.asar into the app bundle.
+# restore.sh — restore the original (unmodified) app.asar into the installed
+# app bundle (/Applications/BaiduNetdisk_mac.app, override with APP=...).
 #
 # macOS TCC "App Management" denies writing into the installed bundle, so
 # this assembles a repaired copy from the backup and swaps the whole bundle.
@@ -7,7 +8,7 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-APP="$PROJECT_DIR/BaiduNetdisk_mac.app"
+APP="${APP:-/Applications/BaiduNetdisk_mac.app}"
 BACKUP_DIR="$PROJECT_DIR/backup"
 BUILD_DIR="$PROJECT_DIR/build"
 

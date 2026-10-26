@@ -21,14 +21,11 @@ metadata:
 
 ## 前置条件（重要）
 
-1. **客户端必须运行且已登录**。工程副本路径：
-   ```bash
-   open ~/Projects/PersonalProj/BaiduPan/BaiduNetdisk_mac.app
-   ```
-   启动后 bridge 约 5 秒内就绪（监听 `127.0.0.1:8765`）。用 `baidupan.sh status`
-   验证；连接失败时脚本会给出明确提示。
-2. 不要去 `/Applications/BaiduNetdisk_mac.app` 启动——那份没有注入 bridge，
-   必须用工程副本路径。
+1. **客户端必须运行且已登录**。正常启动已安装的客户端即可
+   （如 `open /Applications/BaiduNetdisk_mac.app`，或从启动台/Spotlight 打开）。
+   启动后 bridge 约 5 秒内就绪（监听 `127.0.0.1:8765`）。
+2. 用 `baidupan.sh status` 验证：能返回登录态/配额即说明当前运行的是
+   注入后的客户端；连接失败时脚本会给出明确提示（未运行 / 未注入）。
 3. Token 位于 `~/Library/Application Support/baidunetdisk/agent-bridge-token`，
    脚本自动读取，无需手动传。
 
@@ -79,20 +76,20 @@ baidupan.sh share /工作备份/报告.pdf         # 或 share <path> abcd 7
 
 | 现象 | 处理 |
 |---|---|
-| 连接被拒 | 客户端没运行：`open ~/Projects/PersonalProj/BaiduNetdisk_mac.app`，登录后重试 |
+| 连接被拒 | 先 `baidupan.sh status` 看提示：客户端没运行就启动它并登录后重试；提示已运行但 bridge 无响应，说明当前安装的客户端未注入（重装/升级过），需用仓库里的 `agent-bridge/build.sh` 重新注入 |
 | 提示未登录 | 在客户端 UI 里登录，凭证会自动跟随（30 秒缓存） |
 | 上传长时间不动 | 先 `baidupan.sh transfers` 看 failed 计数；本地文件是否被移动 |
 | 其他 | 看日志：`~/Library/Application Support/baidunetdisk/agent-bridge.log` |
 
 ## 实现说明（维护者参考）
 
-- 底层是注入到客户端主进程的 MCP 服务（Streamable HTTP，Bearer 鉴权），
-  源码在 `~/Projects/PersonalProj/BaiduPan/agent-bridge/agent-bridge.js`，
-  构建入口 `build.sh`（解包 asar → 注入 → 重签名）。
+- 底层是注入到客户端主进程的 MCP 服务（Streamable HTTP，Bearer 鉴权）。
+  源码与构建脚本见仓库 `agent-bridge/`（注入目标：
+  `/Applications/BaiduNetdisk_mac.app`，构建前会校验客户端版本 ≥ 8.9.7）。
 - MCP 注册（Claude Code 等原生 MCP 客户端可直接用，与 skill 并行不冲突）：
   ```bash
   claude mcp add --transport http baidupan http://127.0.0.1:8765/mcp \
     --header "Authorization: Bearer $(cat ~/Library/Application\ Support/baidunetdisk/agent-bridge-token)"
   ```
-- 客户端自动升级已禁用（`app-update.yml` → `.disabled`）；手动升级客户端后
+- 客户端自动升级已禁用（`app-update.yml` → `.disabled`）；手动升级/重装客户端后
   需重跑 `agent-bridge/build.sh` 重新注入。

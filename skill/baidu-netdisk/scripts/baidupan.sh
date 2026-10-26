@@ -3,7 +3,6 @@
 # Talks to the MCP server injected into the local Baidu Netdisk macOS client.
 set -euo pipefail
 
-APP_PATH="$HOME/Projects/PersonalProj/BaiduPan/BaiduNetdisk_mac.app"
 TOKEN_FILE="$HOME/Library/Application Support/baidunetdisk/agent-bridge-token"
 URL="http://127.0.0.1:8765/mcp"
 
@@ -63,12 +62,14 @@ console.log(JSON.stringify({jsonrpc:"2.0",id:1,method:"tools/call",
     -d "$body") || rc=$?
   if [ "$rc" != 0 ]; then
     echo "ERROR: cannot reach the MCP bridge at $URL" >&2
-    if ! pgrep -f "BaiduPan/BaiduNetdisk_mac.app/Contents/MacOS" >/dev/null 2>&1; then
-      echo "The Baidu Netdisk app is not running. Start it with:" >&2
-      echo "  open $APP_PATH" >&2
-      echo "then make sure you are logged in, and retry." >&2
+    if ! pgrep -f "BaiduNetdisk_mac.app/Contents/MacOS" >/dev/null 2>&1; then
+      echo "The Baidu Netdisk client is not running. Start it (e.g." >&2
+      echo "  open /Applications/BaiduNetdisk_mac.app" >&2
+      echo "), make sure you are logged in, and retry." >&2
     else
-      echo "The app is running but the bridge is not answering. Check:" >&2
+      echo "The client is running but the bridge is not answering — the" >&2
+      echo "installed client may be un-injected (reinstalled/upgraded) or" >&2
+      echo "still starting. Check:" >&2
       echo "  ~/Library/Application Support/baidunetdisk/agent-bridge.log" >&2
     fi
     exit 2

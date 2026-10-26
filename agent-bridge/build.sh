@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
-# build.sh — inject agent-bridge.js into the Baidu Netdisk app bundle.
+# build.sh — inject agent-bridge.js into the installed Baidu Netdisk app bundle.
+#
+# Target: /Applications/BaiduNetdisk_mac.app (override with APP=/path/app).
+# Before touching anything the script verifies the client version and asar
+# layout (this bridge supports client 8.9.7+ only) and whether the bundle is
+# already injected.
 #
 # Flow: (re)create pristine extraction from the original backup asar,
-# add the bridge module, append a require to main.js, repack with the
+# add the bridge module, append a require to entry.js, repack with the
 # same unpacked set, reinstall into the .app and re-sign (ad-hoc).
 #
 # Toolchain note: this machine's `node`/`npx` shell functions are broken nvm
@@ -13,7 +18,7 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-APP="$PROJECT_DIR/BaiduNetdisk_mac.app"
+APP="${APP:-/Applications/BaiduNetdisk_mac.app}"
 RESOURCES="$APP/Contents/Resources"
 ASAR="$RESOURCES/app.asar"
 BACKUP_DIR="$PROJECT_DIR/backup"
@@ -22,10 +27,24 @@ EXTRACTED="$BUILD_DIR/extracted"
 NPX=/opt/homebrew/bin/npx
 NPM=/opt/homebrew/bin/npm
 NODE=/opt/homebrew/bin/node
+# Minimum client version this bridge supports (obfuscated entry.js layout).
+MIN_VERSION="8.9.7"
 # NOTE: the asar CLI mangles brace globs in --unpack-dir (only the first
 # alternative matches); the library API handles them correctly, so packing
 # goes through a small node script that imports @electron/asar directly.
 UNPACK_DIR_GLOB='node_modules/{@baidu,electron-clipboard-ex,koffi,macos-notification-state,uiohook-napi,windows-notification-state,windows-quiet-hours}'
+
+# version_ge <installed> <required> — dotted-numeric semver compare.
+version_ge() {
+  awk -v a="$1" -v b="$2" 'BEGIN {
+    n = split(a, x, "."); m = split(b, y, ".");
+    for (i = 1; i <= n || i <= m; i++) {
+      dx = (i <= n) ? x[i] + 0 : 0; dy = (i <= m) ? y[i] + 0 : 0;
+      if (dx > dy) exit 0; if (dx < dy) exit 1;
+    }
+    exit 0
+  }'
+}
 
 echo "==> Checking prerequisites"
 [ -d "$APP" ] || { echo "App bundle not found: $APP" >&2; exit 1; }
@@ -38,15 +57,78 @@ if pgrep -f "$APP/Contents/MacOS" >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "==> Creating pristine backup (first run only)"
-mkdir -p "$BACKUP_DIR"
-if [ ! -f "$BACKUP_DIR/app.asar" ]; then
-  cp "$ASAR" "$BACKUP_DIR/app.asar"
-  echo "    backed up original asar -> $BACKUP_DIR/app.asar"
+echo "==> Verifying client version"
+VERSION="$(plutil -extract CFBundleShortVersionString raw "$APP/Contents/Info.plist")" || {
+  echo "ERROR: cannot read CFBundleShortVersionString from $APP/Contents/Info.plist" >&2
+  exit 1
+}
+if ! version_ge "$VERSION" "$MIN_VERSION"; then
+  echo "ERROR: client version $VERSION is not supported (need >= $MIN_VERSION)." >&2
+  echo "       This bridge targets the obfuscated dist/electron/entry.js layout" >&2
+  echo "       introduced in $MIN_VERSION. Upgrade the official client first." >&2
+  exit 1
 fi
-if [ ! -d "$BACKUP_DIR/app.asar.unpacked" ]; then
-  cp -R "$RESOURCES/app.asar.unpacked" "$BACKUP_DIR/app.asar.unpacked"
-  echo "    backed up original app.asar.unpacked -> $BACKUP_DIR/app.asar.unpacked"
+echo "    client version $VERSION (>= $MIN_VERSION), OK"
+
+echo "==> Preparing asar tooling"
+mkdir -p "$BUILD_DIR/pack-tools"
+if [ ! -d "$BUILD_DIR/pack-tools/node_modules/@electron/asar" ]; then
+  echo '{"name":"pack-tools","private":true}' > "$BUILD_DIR/pack-tools/package.json"
+  (cd "$BUILD_DIR/pack-tools" && "$NPM" install --silent @electron/asar)
+fi
+
+echo "==> Verifying asar layout and injection state"
+# v2 layout check: obfuscated entry at dist/electron/entry.js; also detect an
+# existing injection (agent-bridge.js already inside the archive) so we know
+# whether the on-disk asar can serve as a pristine backup source.
+ASAR_STATE="$(cd "$BUILD_DIR/pack-tools" && ASAR="$ASAR" "$NODE" --input-type=module -e "
+import { listPackage } from '@electron/asar';
+const files = listPackage(process.env.ASAR).map(f => f.replace(/^\//, '').replace(/\/$/, ''));
+const has = (p) => files.includes(p);
+process.stdout.write(
+  (has('dist/electron/entry.js') ? 'entry=yes' : 'entry=no') + ' ' +
+  (has('dist/electron/agent-bridge.js') ? 'injected=yes' : 'injected=no'));
+")"
+case "$ASAR_STATE" in
+  "entry=yes injected=no"|"entry=yes injected=yes") ;;
+  *)
+    echo "ERROR: unexpected asar layout ($ASAR_STATE): dist/electron/entry.js not" >&2
+    echo "       found. This bridge supports client $MIN_VERSION+ only." >&2
+    exit 1
+    ;;
+esac
+ALREADY_INJECTED="${ASAR_STATE##*injected=}"
+echo "    entry.js layout OK; injected=$ALREADY_INJECTED"
+
+echo "==> Creating pristine backup"
+# backup/app.version stamps the client version the backup was taken from, so
+# a manual client upgrade (fresh pristine install) refreshes the backup.
+mkdir -p "$BACKUP_DIR"
+if [ "$ALREADY_INJECTED" = "yes" ]; then
+  # The on-disk asar contains the injection, so it cannot serve as a backup
+  # source; only the existing pristine backup lets us rebuild.
+  if [ ! -f "$BACKUP_DIR/app.asar" ]; then
+    echo "ERROR: app is already injected but no pristine backup exists at" >&2
+    echo "       $BACKUP_DIR — reinstall the official client, then rerun." >&2
+    exit 1
+  fi
+  if [ "$(cat "$BACKUP_DIR/app.version" 2>/dev/null || true)" != "$VERSION" ]; then
+    echo "ERROR: app is injected but the backup is from a different client" >&2
+    echo "       version (backup: $(cat "$BACKUP_DIR/app.version" 2>/dev/null || echo unknown), app: $VERSION)." >&2
+    echo "       Reinstall the official client, then rerun." >&2
+    exit 1
+  fi
+  echo "    keeping existing pristine backup ($BACKUP_DIR)"
+else
+  if [ ! -f "$BACKUP_DIR/app.asar" ] || [ "$(cat "$BACKUP_DIR/app.version" 2>/dev/null || true)" != "$VERSION" ]; then
+    rm -rf "$BACKUP_DIR/app.asar" "$BACKUP_DIR/app.asar.unpacked"
+    cp "$ASAR" "$BACKUP_DIR/app.asar"
+    cp -R "$RESOURCES/app.asar.unpacked" "$BACKUP_DIR/app.asar.unpacked"
+    echo "$VERSION" > "$BACKUP_DIR/app.version"
+    echo "    backed up original asar ($VERSION) -> $BACKUP_DIR"
+  else
+    echo "    pristine backup for $VERSION already exists"
+  fi
 fi
 
 echo "==> Extracting original asar"
@@ -63,11 +145,6 @@ EOF
 
 echo "==> Repacking asar"
 rm -rf "$BUILD_DIR/app.asar" "$BUILD_DIR/app.asar.unpacked"
-mkdir -p "$BUILD_DIR/pack-tools"
-if [ ! -d "$BUILD_DIR/pack-tools/node_modules/@electron/asar" ]; then
-  echo '{"name":"pack-tools","private":true}' > "$BUILD_DIR/pack-tools/package.json"
-  (cd "$BUILD_DIR/pack-tools" && "$NPM" install --silent @electron/asar)
-fi
 (cd "$BUILD_DIR/pack-tools" && UNPACK_DIR_GLOB="$UNPACK_DIR_GLOB" EXTRACTED="$EXTRACTED" OUTPUT="$BUILD_DIR/app.asar" "$NODE" --input-type=module -e "
 import { createPackageWithOptions } from '@electron/asar';
 await createPackageWithOptions(process.env.EXTRACTED, process.env.OUTPUT, { unpackDir: process.env.UNPACK_DIR_GLOB });

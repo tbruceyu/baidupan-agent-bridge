@@ -16,8 +16,13 @@ cd agent-bridge
 ./build.sh
 ```
 
-构建完成后启动 `../BaiduNetdisk_mac.app`（必须处于登录状态），服务监听
-`http://127.0.0.1:8765/mcp`。
+默认注入 `/Applications/BaiduNetdisk_mac.app`（可用 `APP=/path/app` 覆盖）。
+脚本会先校验客户端版本（需 ≥ 8.9.7，从 Info.plist 读取）和 asar 布局
+（混淆入口 `dist/electron/entry.js`），不匹配则拒绝注入；
+已注入过但缺少原始备份时也会拒绝（无法重建干净的 asar）。
+
+构建完成后启动 `/Applications/BaiduNetdisk_mac.app`（必须处于登录状态），
+服务监听 `http://127.0.0.1:8765/mcp`。
 
 ## Claude Code 接入
 

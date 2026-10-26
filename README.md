@@ -17,12 +17,13 @@
 ## 快速开始
 
 ```bash
-# 1) 把官方客户端放进本目录（或把 .app 路径改到 build.sh 中）
+# 1) 确认官方客户端已安装在 /Applications/BaiduNetdisk_mac.app（8.9.7+，
+#    build.sh 会先校验版本与 asar 布局再注入）
 # 2) 注入（会自动备份原始 asar 到 backup/）
 cd agent-bridge && ./build.sh
 
 # 3) 启动客户端并登录
-open ../BaiduNetdisk_mac.app
+open /Applications/BaiduNetdisk_mac.app
 
 # 4) Claude Code 接入（MCP）
 claude mcp add --transport http baidupan http://127.0.0.1:8765/mcp \
