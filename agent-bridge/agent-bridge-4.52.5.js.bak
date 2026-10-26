@@ -1,0 +1,1026 @@
+'use strict';
+
+/**
+ * agent-bridge.js — MCP service injected into the Baidu Netdisk (macOS)
+ * Electron main process.
+ *
+ * Exposes the logged-in account's cloud drive to local agents (e.g. Claude
+ * Code) through an MCP Streamable HTTP endpoint bound to 127.0.0.1:8765/mcp.
+ *
+ * Design notes:
+ *  - Zero external dependencies: Node built-ins + the `electron` module only.
+ *  - API calls reuse the app's own authenticated axios instance `app.$Net`
+ *    (carries BDUSS/STOKEN cookies, the "netdisk" User-Agent and common query
+ *    params such as app_id). Cookies are re-read on every request so a fresh
+ *    login (`app.$resetNetConf`) is picked up automatically.
+ *  - Reads (list/search/quota/uinfo) go through `app.$Net`; the app's network
+ *    layer intercepts some xpan writes and the filemetas endpoint, so those go
+ *    through plain Node https with the same cookies/UA (httpsPostForm /
+ *    httpsGetJson).
+ *  - Uploads are delegated to the app's native upload engine
+ *    (`app.$uploader.addFiles`), the same entry the app itself uses, so
+ *    transfers behave exactly like manual uploads (queue, resume, UI).
+ *  - Downloads resolve a dlink via the legacy /api/filemetas endpoint (web
+ *    params) and stream it with plain Node https.
+ */
+
+const http = require('http');
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const crypto = require('crypto');
+const querystring = require('querystring');
+const { app } = require('electron');
+
+const PORT = 8765;
+const BIND_HOST = '127.0.0.1';
+const PROTOCOL_VERSION = '2025-03-26';
+const SERVER_NAME = 'baidupan-agent-bridge';
+const SERVER_VERSION = '1.0.0';
+const DOWNLOAD_SUBDIR = 'baidupan-mcp';
+const MAX_BODY_BYTES = 10 * 1024 * 1024;
+const FALLBACK_UA = 'netdisk;4.52.5;PC;PC-Mac;MacBaiduYunGuanJia';
+
+// --------------------------------------------------------------------------
+// Logging
+// --------------------------------------------------------------------------
+
+function logPath() {
+  return path.join(app.getPath('userData'), 'agent-bridge.log');
+}
+
+function log(...args) {
+  try {
+    const line = `[${new Date().toISOString()}] [agent-bridge] ${args.join(' ')}\n`;
+    const p = logPath();
+    let size = 0;
+    try { size = fs.statSync(p).size; } catch (e) { /* first line */ }
+    if (size > 1024 * 1024) fs.writeFileSync(p, line); // simple rotation at 1MB
+    else fs.appendFileSync(p, line);
+  } catch (e) { /* logging must never break the host app */ }
+}
+
+// --------------------------------------------------------------------------
+// Auth token for the local MCP endpoint
+// --------------------------------------------------------------------------
+
+function tokenPath() {
+  return path.join(app.getPath('userData'), 'agent-bridge-token');
+}
+
+function loadOrCreateToken() {
+  const p = tokenPath();
+  try {
+    const existing = fs.readFileSync(p, 'utf8').trim();
+    if (/^[0-9a-f]{32,}$/.test(existing)) return existing;
+  } catch (e) { /* not created yet */ }
+  const token = crypto.randomBytes(24).toString('hex');
+  fs.writeFileSync(p, token, { mode: 0o600 });
+  try { fs.chmodSync(p, 0o600); } catch (e) { /* best effort */ }
+  return token;
+}
+
+// --------------------------------------------------------------------------
+// Credentials / net helpers
+// --------------------------------------------------------------------------
+
+function getNet() {
+  return app && app.$Net && typeof app.$Net.get === 'function' ? app.$Net : null;
+}
+
+function readCookieHeader(net) {
+  const h = net && net.defaults && net.defaults.headers;
+  if (!h) return '';
+  const candidates = [
+    h.Cookie, h.cookie,
+    h.common && h.common.Cookie, h.common && h.common.cookie,
+  ];
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.indexOf('BDUSS=') !== -1) return c;
+  }
+  return '';
+}
+
+// Fallback credential source: the native engine's encrypted local_info store.
+function decryptUserInfo() {
+  try {
+    if (typeof app.$getAppConfByKey === 'function' &&
+        typeof app.$decryptUserInfo === 'function') {
+      const enc = app.$getAppConfByKey('local_info', 'userInfo');
+      if (enc) {
+        const info = app.$decryptUserInfo(enc);
+        if (info && info.BDUSS) return info;
+      }
+    }
+  } catch (e) { /* ignore */ }
+  return null;
+}
+
+// Returns { cookie, userAgent } or null when not logged in.
+function authHeaders() {
+  const net = getNet();
+  let cookie = readCookieHeader(net);
+  let userAgent =
+    (net && net.defaults && net.defaults.headers &&
+      (net.defaults.headers['User-Agent'] || net.defaults.headers.common &&
+        net.defaults.headers.common['User-Agent'])) || FALLBACK_UA;
+  if (typeof userAgent !== 'string') userAgent = FALLBACK_UA;
+  if (!cookie) {
+    const info = decryptUserInfo();
+    if (info) cookie = `BDUSS=${info.BDUSS};STOKEN=${info.STOKEN || ''}`;
+  }
+  if (!cookie) return null;
+  return { cookie, userAgent };
+}
+
+function requireLogin() {
+  const auth = authHeaders();
+  if (!auth) {
+    const err = new Error('Not logged in. Please log in to Baidu Netdisk first, then retry.');
+    err.code = 'NOT_LOGGED_IN';
+    throw err;
+  }
+  return auth;
+}
+
+function parseJsonBody(data) {
+  if (data == null) return {};
+  if (typeof data === 'string') {
+    try { return JSON.parse(data); } catch (e) { return {}; }
+  }
+  return data;
+}
+
+function checkErrno(data, context) {
+  const body = parseJsonBody(data);
+  // Some endpoints report `error_code` instead of `errno`.
+  const code = body && typeof body.errno === 'number' ? body.errno :
+    (body && typeof body.error_code === 'number' ? body.error_code : 0);
+  const msg = body && (body.errmsg || body.error_msg || body.show_msg);
+  if (code !== 0) {
+    // filemanager ops report per-item results in `info`; a non-zero top-level
+    // errno is not a failure when every item succeeded.
+    if (Array.isArray(body.info) && body.info.length &&
+        body.info.every((it) => it && it.errno === 0)) {
+      return body;
+    }
+    const err = new Error(
+      `${context} failed: errno=${code}` +
+      (msg ? ` (${msg})` : '') +
+      (Array.isArray(body.info) ? ` info: ${JSON.stringify(body.info).slice(0, 300)}` : '') +
+      (code === -6 ? ' — login expired, please re-login in the Baidu Netdisk app.' : '')
+    );
+    err.code = 'API_ERRNO';
+    err.errno = code;
+    err.body = body;
+    throw err;
+  }
+  return body;
+}
+
+async function apiGet(urlWithQuery, extraConfig) {
+  const net = getNet();
+  if (!net) throw new Error('app.$Net is not available (app not ready).');
+  const res = await net.get(urlWithQuery, Object.assign(
+    { params: {}, timeout: 30000 }, extraConfig || {}));
+  return checkErrno(res && res.data, `GET ${urlWithQuery.split('?')[0]}`);
+}
+
+async function apiPostForm(urlWithQuery, form) {
+  const net = getNet();
+  if (!net) throw new Error('app.$Net is not available (app not ready).');
+  const res = await net.post(urlWithQuery, querystring.stringify(form || {}), {
+    params: {},
+    timeout: 30000,
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+  });
+  // NOTE: some xpan endpoints are intercepted by the app's network layer and
+  // never resolve an axios response; those go through httpsPostForm instead.
+  return checkErrno(res && res.data, `POST ${urlWithQuery.split('?')[0]}`);
+}
+
+function normalizeRemotePath(p) {
+  let s = String(p || '');
+  if (!s.startsWith('/')) s = '/' + s;
+  if (s.length > 1 && s.endsWith('/')) s = s.slice(0, -1);
+  return s;
+}
+
+function splitRemotePath(p) {
+  const norm = normalizeRemotePath(p);
+  const idx = norm.lastIndexOf('/');
+  const name = norm.slice(idx + 1);
+  const parent = idx <= 0 ? '/' : norm.slice(0, idx);
+  return { parent, name };
+}
+
+// Resolve a remote file path to its metadata (fs_id, size, isdir, ...).
+async function statByPath(remotePath) {
+  const norm = normalizeRemotePath(remotePath);
+  if (norm === '/') throw new Error('Remote path is the root directory.');
+  const { parent, name } = splitRemotePath(norm);
+  const body = await apiGet(
+    '/rest/2.0/xpan/file?method=list&dir=' + encodeURIComponent(parent) +
+    '&order=name&start=0&limit=1000');
+  const list = body.list || [];
+  const entry = list.find((f) => f.server_filename === name) || null;
+  if (!entry) {
+    const err = new Error(`Remote path not found: ${norm}`);
+    err.code = 'NOT_FOUND';
+    throw err;
+  }
+  return entry;
+}
+
+// Common query params (app_id, clienttype, ...) that the app's axios
+// interceptors merge into every request. Retrieved by making a cheap probe
+// request through app.$Net and reading back the merged config.params.
+async function getCommonParams() {
+  const net = getNet();
+  if (!net) return {};
+  try {
+    const res = await net.get('/api/quota?checkfree=1', { params: {}, timeout: 30000 });
+    const p = res && res.config && res.config.params;
+    if (p && typeof p === 'object') {
+      const out = {};
+      for (const k of Object.keys(p)) {
+        if (p[k] !== undefined && p[k] !== null && p[k] !== '') out[k] = String(p[k]);
+      }
+      return out;
+    }
+  } catch (e) { /* fall back to no extra params */ }
+  return {};
+}
+
+// Plain Node https form POST returning parsed JSON. The app's axios layer
+// intercepts /rest/2.0/xpan/file writes and never resolves an axios response,
+// so xpan mutations must bypass app.$Net entirely.
+async function httpsPostForm(urlWithQuery, form, opts) {
+  const auth = authHeaders();
+  if (!auth) {
+    const err = new Error('Not logged in. Please log in to Baidu Netdisk first, then retry.');
+    err.code = 'NOT_LOGGED_IN';
+    throw err;
+  }
+  const common = opts && opts.noCommon ? {} : await getCommonParams();
+  const url = buildUrl('https://pan.baidu.com' + urlWithQuery, common);
+  return new Promise((resolve, reject) => {
+    let parsed;
+    try { parsed = new URL(url); } catch (e) { reject(e); return; }
+    const body = querystring.stringify(form || {});
+    const req = https.request(parsed, {
+      method: 'POST',
+      headers: Object.assign({
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(body),
+      }, { 'User-Agent': auth.userAgent, Cookie: auth.cookie }),
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        let bodyJson;
+        try { bodyJson = JSON.parse(text); } catch (e) {
+          reject(new Error(`Non-JSON response (HTTP ${res.statusCode}): ${text.slice(0, 200)}`));
+          return;
+        }
+        try { resolve(checkErrno(bodyJson, `POST ${parsed.pathname}`)); }
+        catch (e) { reject(e); }
+      });
+      res.on('error', reject);
+    });
+    req.on('error', reject);
+    req.setTimeout(30000, () => req.destroy(new Error('Request timed out')));
+    req.end(body);
+  });
+}
+
+// Plain Node https GET returning parsed JSON (follows redirects).
+// Used for endpoints where the app's old axios build misbehaves (filemetas).
+function httpsGetJson(url, headers, redirectsLeft) {
+  if (redirectsLeft == null) redirectsLeft = 5;
+  return new Promise((resolve, reject) => {
+    let parsed;
+    try { parsed = new URL(url); } catch (e) { reject(e); return; }
+    const mod = parsed.protocol === 'http:' ? http : https;
+    const req = mod.get(parsed, { headers }, (res) => {
+      const status = res.statusCode || 0;
+      if ([301, 302, 303, 307, 308].indexOf(status) !== -1 && res.headers.location) {
+        res.resume();
+        if (redirectsLeft <= 0) { reject(new Error('Too many redirects')); return; }
+        resolve(httpsGetJson(new URL(res.headers.location, parsed).toString(), headers, redirectsLeft - 1));
+        return;
+      }
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        try { resolve(JSON.parse(text)); } catch (e) { reject(new Error(`Non-JSON response (HTTP ${status}): ${text.slice(0, 200)}`)); }
+      });
+      res.on('error', reject);
+    });
+    req.on('error', reject);
+  });
+}
+
+function buildUrl(base, params) {
+  const qs = Object.keys(params)
+    .map((k) => `${encodeURIComponent(k)}=${encodeURIComponent(params[k])}`)
+    .join('&');
+  return base + (base.includes('?') ? '&' : '?') + qs;
+}
+
+// HTTP(S) GET that follows redirects and resolves to a streaming response.
+function httpStream(url, headers, redirectsLeft) {
+  if (redirectsLeft == null) redirectsLeft = 10;
+  return new Promise((resolve, reject) => {
+    let parsed;
+    try { parsed = new URL(url); } catch (e) { reject(e); return; }
+    const mod = parsed.protocol === 'http:' ? http : https;
+    const req = mod.get(parsed, { headers }, (res) => {
+      const status = res.statusCode || 0;
+      if ([301, 302, 303, 307, 308].indexOf(status) !== -1 && res.headers.location) {
+        res.resume();
+        if (redirectsLeft <= 0) { reject(new Error('Too many redirects')); return; }
+        const next = new URL(res.headers.location, parsed).toString();
+        resolve(httpStream(next, headers, redirectsLeft - 1));
+        return;
+      }
+      if (status !== 200) {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8');
+          reject(new Error(`Download failed: HTTP ${status} from ${parsed.host}: ${text.slice(0, 300)}`));
+        });
+        res.on('error', reject);
+        return;
+      }
+      resolve(res);
+    });
+    req.on('error', reject);
+  });
+}
+
+function uniqueLocalPath(target) {
+  let candidate = target;
+  let i = 1;
+  const ext = path.extname(target);
+  const base = target.slice(0, target.length - ext.length);
+  while (fs.existsSync(candidate)) {
+    candidate = `${base} (${i})${ext}`;
+    i += 1;
+  }
+  return candidate;
+}
+
+// --------------------------------------------------------------------------
+// Tool implementations (plain values / errors, MCP framing is done by caller)
+// --------------------------------------------------------------------------
+
+const toolImplementations = {
+
+  async baidu_status() {
+    const auth = requireLogin();
+    const out = { logged_in: true, bridge_version: SERVER_VERSION };
+    try {
+      const info = await apiGet('/rest/2.0/xpan/nas?method=uinfo');
+      out.user = {
+        uk: info.uk, baidu_name: info.baidu_name, netdisk_name: info.netdisk_name,
+        vip: info.vip, avatar: info.avatar,
+      };
+    } catch (e) { out.user_error = e.message; }
+    try {
+      const q = await apiGet('/api/quota?checkfree=1&checkexpire=1');
+      out.quota = {
+        total: q.total, used: q.used, free: q.free || (q.total - q.used),
+      };
+    } catch (e) { out.quota_error = e.message; }
+    return out;
+  },
+
+  async baidu_get_quota() {
+    requireLogin();
+    const q = await apiGet('/api/quota?checkfree=1&checkexpire=1');
+    return {
+      total: q.total, used: q.used,
+      free: q.free || (q.total - q.used),
+      total_human: humanSize(q.total), used_human: humanSize(q.used),
+    };
+  },
+
+  async baidu_list_files(args) {
+    requireLogin();
+    const dir = normalizeRemotePath(args.dir);
+    const start = Number.isFinite(args.start) ? Math.max(0, args.start | 0) : 0;
+    let limit = Number.isFinite(args.limit) ? args.limit | 0 : 100;
+    limit = Math.min(Math.max(limit, 1), 1000);
+    const body = await apiGet(
+      '/rest/2.0/xpan/file?method=list&dir=' + encodeURIComponent(dir) +
+      `&order=name&start=${start}&limit=${limit}`);
+    const list = (body.list || []).map((f) => ({
+      fs_id: f.fs_id,
+      path: f.path,
+      name: f.server_filename,
+      is_dir: !!f.isdir,
+      size: f.size || 0,
+      size_human: humanSize(f.size || 0),
+      category: f.category,
+      modified: f.server_mtime || f.local_mtime,
+    }));
+    return { dir, start, limit, count: list.length, files: list };
+  },
+
+  async baidu_search_files(args) {
+    requireLogin();
+    const key = String(args.key || '').trim();
+    if (!key) throw new Error('Parameter "key" must not be empty.');
+    let url = '/rest/2.0/xpan/file?method=search&key=' + encodeURIComponent(key) +
+      '&recursion=1&start=0&limit=200';
+    if (args.dir) url += '&dir=' + encodeURIComponent(normalizeRemotePath(args.dir));
+    const body = await apiGet(url);
+    const list = (body.list || []).map((f) => ({
+      fs_id: f.fs_id, path: f.path, name: f.server_filename,
+      is_dir: !!f.isdir, size: f.size || 0, size_human: humanSize(f.size || 0),
+    }));
+    return { key, count: list.length, files: list };
+  },
+
+  async baidu_download_file(args) {
+    const auth = requireLogin();
+    const remotePath = normalizeRemotePath(args.remote_path);
+    const entry = await statByPath(remotePath);
+    if (entry.isdir) throw new Error(`Remote path is a directory: ${remotePath}`);
+
+    // NOTE: the xpan multifile endpoint 404s for this client; the app's own URL
+    // map uses the legacy /api/filemetas endpoint, which returns {info:[{dlink}]}.
+    // Client-params dlinks are signed for the native downloader and pcs rejects
+    // them with "sign error"; web-style params yield a dlink usable with the
+    // plain "netdisk" UA, so fetch that variant, falling back to client params.
+    const fsids = JSON.stringify([Number(entry.fs_id)]);
+    const baseParams = { dlink: 1, fsids, gid: 0, download: 1 };
+    const metaHeaders = {
+      'User-Agent': auth.userAgent,
+      Cookie: auth.cookie,
+    };
+    let meta = null;
+    const dlinkErrors = [];
+    const metaVariants = [
+      ['web', Object.assign({}, baseParams, { app_id: '250528', web: 1, clienttype: 0 })],
+      ['client', Object.assign({}, baseParams, await getCommonParams())],
+    ];
+    for (const [label, params] of metaVariants) {
+      try {
+        const metas = await httpsGetJson(buildUrl('https://pan.baidu.com/api/filemetas', params), metaHeaders);
+        const m = metas && metas.info && metas.info[0];
+        if (m && m.dlink) { meta = m; log(`using ${label}-style dlink`); break; }
+        dlinkErrors.push(`${label}: no dlink in response`);
+      } catch (e) { dlinkErrors.push(`${label}: ${e.message}`); }
+    }
+    if (!meta) {
+      throw new Error('Failed to resolve download link (dlink): ' + dlinkErrors.join('; ').slice(0, 500));
+    }
+
+    let localPath;
+    if (args.local_path) {
+      localPath = path.resolve(os.homedir(), String(args.local_path));
+      const dir = path.dirname(localPath);
+      fs.mkdirSync(dir, { recursive: true });
+    } else {
+      const dir = path.join(os.homedir(), 'Downloads', DOWNLOAD_SUBDIR);
+      fs.mkdirSync(dir, { recursive: true });
+      localPath = path.join(dir, entry.server_filename || path.basename(remotePath));
+    }
+    localPath = uniqueLocalPath(localPath);
+
+    // pcs download servers reject some cookie shapes ("sign error"), so try
+    // progressively narrower cookies: full client cookie, then BDUSS-only.
+    const cookieVariants = [auth.cookie];
+    const bduss = /(?:^|;\s*)BDUSS=([^;]+)/.exec(auth.cookie);
+    if (bduss) cookieVariants.push(`BDUSS=${bduss[1]}`);
+    let stream = null;
+    let lastErr = null;
+    for (const cookie of cookieVariants) {
+      try {
+        stream = await httpStream(meta.dlink, {
+          'User-Agent': auth.userAgent,
+          Cookie: cookie,
+        });
+        break;
+      } catch (e) { lastErr = e; log(`download attempt failed: ${e.message}`); }
+    }
+    if (!stream) throw lastErr;
+    const expected = Number(entry.size) || 0;
+    await new Promise((resolve, reject) => {
+      const out = fs.createWriteStream(localPath);
+      let received = 0;
+      stream.on('data', (chunk) => { received += chunk.length; });
+      stream.on('error', reject);
+      out.on('error', reject);
+      out.on('finish', () => {
+        if (expected && received !== expected) {
+          reject(new Error(`Size mismatch: expected ${expected} bytes, got ${received}.`));
+        } else resolve();
+      });
+      stream.pipe(out);
+    });
+    log(`downloaded ${remotePath} -> ${localPath} (${expected} bytes)`);
+    return {
+      remote_path: remotePath,
+      local_path: localPath,
+      size: expected,
+      size_human: humanSize(expected),
+    };
+  },
+
+  async baidu_upload_file(args) {
+    requireLogin();
+    const localPath = path.resolve(os.homedir(), String(args.local_path));
+    let st;
+    try { st = fs.statSync(localPath); } catch (e) {
+      throw new Error(`Local file not found: ${localPath}`);
+    }
+    if (st.isDirectory()) throw new Error('Uploading directories is not supported; upload files one by one.');
+    const remoteDir = normalizeRemotePath(args.remote_dir || '/');
+    if (!app.$uploader || typeof app.$uploader.addFiles !== 'function') {
+      throw new Error('Native uploader (app.$uploader) is unavailable.');
+    }
+    // Same call shape the app itself uses for manual uploads.
+    app.$uploader.addFiles([{ local_path: localPath, is_dir: 0 }], remoteDir, '0');
+    log(`upload queued: ${localPath} -> ${remoteDir}`);
+    return {
+      local_path: localPath,
+      remote_dir: remoteDir,
+      queued: true,
+      hint: 'The file was added to the app upload queue. Poll baidu_transfer_status to confirm completion.',
+    };
+  },
+
+  async baidu_transfer_status() {
+    requireLogin();
+    const out = {};
+    const tryCall = (obj, method) => {
+      try {
+        if (obj && typeof obj[method] === 'function') {
+          let r = obj[method]();
+          if (r != null && typeof r.then === 'function') return r;
+          return Promise.resolve(r);
+        }
+      } catch (e) { return Promise.resolve({ error: e.message }); }
+      return Promise.resolve(null);
+    };
+    const normalize = (r) => {
+      if (r == null) return null;
+      if (typeof r === 'string') { try { return JSON.parse(r); } catch (e) { return r; } }
+      return r;
+    };
+    out.upload_tasks = normalize(await tryCall(app.$uploader, 'getUploadTasks'));
+    out.download_tasks = normalize(await tryCall(app.$downloader, 'getDownloadTasks'));
+    return out;
+  },
+
+  async baidu_mkdir(args) {
+    requireLogin();
+    const dirPath = normalizeRemotePath(args.path);
+    if (dirPath === '/') throw new Error('Cannot create the root directory.');
+    // The xpan creates endpoint is picky about client params (31296 "internal
+    // error" with the client channel); fall back to web-style params, then to
+    // the legacy web commit API that the web UI itself uses.
+    const variants = [
+      ['xpan', '/rest/2.0/xpan/file?method=creates', { path: dirPath, isdir: 1, rtype: 0 }],
+      ['web', '/rest/2.0/xpan/file?method=creates&app_id=250528&web=1&clienttype=0',
+        { path: dirPath, isdir: 1, rtype: 0 }],
+      // The legacy create API ignores parent_path and treats `path` as the
+      // full target path, so send the complete path.
+      ['legacy', '/api/create?a=commit', { path: dirPath, isdir: 1, rtype: 0 }],
+    ];
+    const errors = [];
+    for (const [label, url, form] of variants) {
+      try {
+        const body = await httpsPostForm(url, form, { noCommon: label !== 'xpan' });
+        return { path: dirPath, created: true, via: label, raw: body };
+      } catch (e) { errors.push(`${label}: ${e.message.slice(0, 150)}`); }
+    }
+    throw new Error('mkdir failed — ' + errors.join('; ').slice(0, 400));
+  },
+
+  async baidu_rename(args) {
+    requireLogin();
+    const oldPath = normalizeRemotePath(args.path);
+    const newName = String(args.new_name || '').trim();
+    if (!newName || newName.includes('/')) {
+      throw new Error('Parameter "new_name" must be a bare file name without "/".');
+    }
+    await statByPath(oldPath); // ensure it exists
+    const filelist = JSON.stringify([{ path: oldPath, newname: newName }]);
+    const variants = [
+      ['legacy', '/api/filemanager?opera=rename&async=0&web=1&clienttype=0&channel=chunlei', { filelist }],
+      ['xpan', '/rest/2.0/xpan/file?method=filemanager&opera=rename&async=0', { filelist }],
+    ];
+    const errors = [];
+    let body = null;
+    for (const [label, url, form] of variants) {
+      try {
+        body = await httpsPostForm(url, form, { noCommon: label === 'legacy' });
+        break;
+      } catch (e) { errors.push(`${label}: ${e.message.slice(0, 150)}`); }
+    }
+    if (!body) throw new Error('rename failed — ' + errors.join('; ').slice(0, 400));
+    return { path: oldPath, new_name: newName, renamed: true, raw: body };
+  },
+
+  async baidu_move(args) {
+    requireLogin();
+    const paths = (Array.isArray(args.paths) ? args.paths : [args.paths])
+      .map(normalizeRemotePath).filter(Boolean);
+    if (!paths.length) throw new Error('Parameter "paths" must be a non-empty path or array.');
+    const dest = normalizeRemotePath(args.dest_dir);
+    const errors = [];
+    let body = null;
+    // xpan move wants per-item objects {path, dest, newname, ondup}; the
+    // legacy web API wants plain paths plus a top-level dest param.
+    const variants = [
+      ['xpan', '/rest/2.0/xpan/file?method=filemanager&opera=move&async=2', {
+        filelist: JSON.stringify(paths.map((p) => ({
+          path: p, dest, newname: path.posix.basename(p), ondup: 'fail',
+        }))),
+      }],
+      ['legacy', '/api/filemanager?opera=move&async=2&web=1&clienttype=0&channel=chunlei', {
+        filelist: JSON.stringify(paths), dest,
+      }],
+    ];
+    for (const [label, url, form] of variants) {
+      try {
+        body = await httpsPostForm(url, form, { noCommon: label === 'legacy' });
+        break;
+      } catch (e) { errors.push(`${label}: ${e.message.slice(0, 150)}`); }
+    }
+    if (!body) throw new Error('move failed — ' + errors.join('; ').slice(0, 400));
+    return { moved: paths, dest_dir: dest, raw: body };
+  },
+
+  async baidu_delete(args) {
+    requireLogin();
+    const paths = (Array.isArray(args.paths) ? args.paths : [args.paths])
+      .map(normalizeRemotePath).filter(Boolean);
+    if (!paths.length) throw new Error('Parameter "paths" must be a non-empty path or array.');
+    const body = await httpsPostForm(
+      '/rest/2.0/xpan/file?method=filemanager&opera=delete&async=0',
+      { filelist: JSON.stringify(paths) });
+    return { deleted: paths, note: 'Deleted files go to the cloud recycle bin.', raw: body };
+  },
+
+  async baidu_create_share(args) {
+    requireLogin();
+    const remotePath = normalizeRemotePath(args.path);
+    await statByPath(remotePath);
+    // Best-effort: the share/set web endpoint; some accounts require extra
+    // verification, in which case the server returns a non-zero errno.
+    const body = await apiPostForm(
+      '/share/set?channel=chunlei&web=1&clienttype=0',
+      {
+        schannel: 4,
+        channel_list: '[]',
+        web: 1,
+        // The endpoint requires a 4-char extraction code (pwd).
+        pwd: String(args.pwd || randomSharePwd()),
+        period: Number.isFinite(args.period_days) ? args.period_days : 0, // 0 = forever
+        path_list: JSON.stringify([remotePath]),
+      });
+    // The response does not echo pwd directly; it embeds it in qrcodeurl.
+    const pwdMatch = /[?&]pwd=([^&]+)/.exec(String(body.qrcodeurl || ''));
+    return {
+      path: remotePath,
+      link: body.link || body.shorturl || null,
+      shareid: body.shareid,
+      pwd: body.pwd || (pwdMatch ? decodeURIComponent(pwdMatch[1]) : null),
+      expires_at: body.expiretime || null,
+      raw: body,
+    };
+  },
+};
+
+// Random 4-char extraction code (letters+digits), like the client UI generates.
+function randomSharePwd() {
+  const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
+  let out = '';
+  for (let i = 0; i < 4; i += 1) out += chars[crypto.randomInt(chars.length)];
+  return out;
+}
+
+function humanSize(n) {
+  n = Number(n) || 0;
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i += 1; }
+  return `${n.toFixed(n >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+// --------------------------------------------------------------------------
+// MCP tool metadata (JSON Schema for each tool's input)
+// --------------------------------------------------------------------------
+
+const stringType = { type: 'string' };
+const integerType = { type: 'integer' };
+
+const TOOL_DEFINITIONS = [
+  {
+    name: 'baidu_status',
+    description: 'Check login status, account info and quota of the Baidu Netdisk client. Run this first when unsure about login state.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'baidu_get_quota',
+    description: 'Get cloud drive storage quota (total/used/free).',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'baidu_list_files',
+    description: 'List files in a remote directory of the Baidu Netdisk drive.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        dir: { type: 'string', description: 'Remote directory path, e.g. "/" or "/docs".' },
+        start: Object.assign({ description: 'Offset for pagination (default 0).' }, integerType),
+        limit: Object.assign({ description: 'Max entries per page, 1-1000 (default 100).' }, integerType),
+      },
+      required: ['dir'],
+    },
+  },
+  {
+    name: 'baidu_search_files',
+    description: 'Search files by keyword across the cloud drive.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        key: { type: 'string', description: 'Search keyword.' },
+        dir: Object.assign({ description: 'Optional scope directory.' }, stringType),
+      },
+      required: ['key'],
+    },
+  },
+  {
+    name: 'baidu_download_file',
+    description: 'Download a remote file to the local machine. Without local_path it goes to ~/Downloads/baidupan-mcp/.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        remote_path: { type: 'string', description: 'Remote file path, e.g. "/docs/a.pdf".' },
+        local_path: { type: 'string', description: 'Optional local destination file path.' },
+      },
+      required: ['remote_path'],
+    },
+  },
+  {
+    name: 'baidu_upload_file',
+    description: 'Upload a local file into a remote directory (queued in the app transfer manager).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        local_path: { type: 'string', description: 'Local file path.' },
+        remote_dir: { type: 'string', description: 'Destination remote directory (default "/").' },
+      },
+      required: ['local_path'],
+    },
+  },
+  {
+    name: 'baidu_transfer_status',
+    description: 'Show current upload/download task queue of the netdisk app.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'baidu_mkdir',
+    description: 'Create a remote directory (parent directories are not auto-created).',
+    inputSchema: {
+      type: 'object',
+      properties: { path: { type: 'string', description: 'Remote directory to create, e.g. "/docs/new".' } },
+      required: ['path'],
+    },
+  },
+  {
+    name: 'baidu_rename',
+    description: 'Rename a remote file or directory.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Existing remote path.' },
+        new_name: { type: 'string', description: 'New bare name (no slashes).' },
+      },
+      required: ['path', 'new_name'],
+    },
+  },
+  {
+    name: 'baidu_move',
+    description: 'Move remote files/directories into a destination directory.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        paths: { type: 'array', items: { type: 'string' }, description: 'One or more remote paths.' },
+        dest_dir: { type: 'string', description: 'Destination remote directory.' },
+      },
+      required: ['paths', 'dest_dir'],
+    },
+  },
+  {
+    name: 'baidu_delete',
+    description: 'Delete remote files/directories (moved to cloud recycle bin).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        paths: { type: 'array', items: { type: 'string' }, description: 'One or more remote paths.' },
+      },
+      required: ['paths'],
+    },
+  },
+  {
+    name: 'baidu_create_share',
+    description: 'Create a share link for a remote path (best-effort; may be rejected by server-side policy).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Remote file or directory to share.' },
+        pwd: { type: 'string', description: 'Extraction code (4 chars). Defaults to a random one.' },
+        period_days: Object.assign({ description: 'Validity in days; 0 = forever (default).' }, integerType),
+      },
+      required: ['path'],
+    },
+  },
+];
+
+// --------------------------------------------------------------------------
+// JSON-RPC / MCP plumbing
+// --------------------------------------------------------------------------
+
+function jsonRpcResult(id, result) {
+  return { jsonrpc: '2.0', id, result };
+}
+
+function jsonRpcError(id, code, message) {
+  return { jsonrpc: '2.0', id, error: { code, message } };
+}
+
+async function handleRpc(msg) {
+  // Notifications (no id) get no response body per JSON-RPC 2.0.
+  if (msg.id === undefined || msg.id === null) return null;
+
+  if (msg.method === 'initialize') {
+    return jsonRpcResult(msg.id, {
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: { tools: {} },
+      serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
+    });
+  }
+  if (msg.method === 'ping') {
+    return jsonRpcResult(msg.id, {});
+  }
+  if (msg.method === 'tools/list') {
+    return jsonRpcResult(msg.id, { tools: TOOL_DEFINITIONS });
+  }
+  if (msg.method === 'tools/call') {
+    const name = msg.params && msg.params.name;
+    const args = (msg.params && msg.params.arguments) || {};
+    const impl = toolImplementations[name];
+    if (!impl) return jsonRpcError(msg.id, -32602, `Unknown tool: ${name}`);
+    log(`tools/call ${name}`);
+    try {
+      const result = await impl(args);
+      return jsonRpcResult(msg.id, {
+        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+        isError: false,
+      });
+    } catch (e) {
+      return jsonRpcResult(msg.id, {
+        content: [{ type: 'text', text: `Error: ${e.message}` }],
+        isError: true,
+      });
+    }
+  }
+  return jsonRpcError(msg.id, -32601, `Method not found: ${msg.method}`);
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    req.on('data', (c) => {
+      total += c.length;
+      if (total > MAX_BODY_BYTES) {
+        reject(new Error('Request body too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+function createMcpServer(token) {
+  const server = http.createServer(async (req, res) => {
+    try {
+      // Anti DNS-rebinding: only accept requests addressed to the local host.
+      const host = String(req.headers.host || '');
+      if (host !== `${BIND_HOST}:${PORT}` && host !== `localhost:${PORT}`) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Forbidden host' }));
+        return;
+      }
+      if (!req.url || req.url.split('?')[0] !== '/mcp') {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Not found' }));
+        return;
+      }
+      if (req.method === 'GET') {
+        // Stateless server: no server-initiated SSE stream.
+        res.writeHead(405, { Allow: 'POST' });
+        res.end();
+        return;
+      }
+      if (req.method !== 'POST') {
+        res.writeHead(405, { Allow: 'POST, GET' });
+        res.end();
+        return;
+      }
+      const contentType = String(req.headers['content-type'] || '');
+      if (!contentType.toLowerCase().startsWith('application/json')) {
+        res.writeHead(415, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Content-Type must be application/json' }));
+        return;
+      }
+      const authHeader = String(req.headers.authorization || '');
+      if (authHeader !== `Bearer ${token}`) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized' }));
+        return;
+      }
+
+      const bodyText = await readBody(req);
+      let parsed;
+      try { parsed = JSON.parse(bodyText); } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid JSON' }));
+        return;
+      }
+
+      const messages = Array.isArray(parsed) ? parsed : [parsed];
+      const isBatch = Array.isArray(parsed);
+      const responses = [];
+      for (const msg of messages) {
+        const resp = await handleRpc(msg);
+        if (resp) responses.push(resp);
+      }
+      // Pure notifications: acknowledge with 202 and empty body.
+      if (!responses.length) { res.writeHead(202); res.end(); return; }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(isBatch ? responses : responses[0]));
+    } catch (e) {
+      log(`request error: ${e && e.message}`);
+      try {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e && e.message }));
+      } catch (e2) { /* socket already gone */ }
+    }
+  });
+  return server;
+}
+
+// --------------------------------------------------------------------------
+// Startup
+// --------------------------------------------------------------------------
+
+async function waitForAppNet(timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (getNet()) return true;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  return !!getNet();
+}
+
+async function start() {
+  try {
+    await app.whenReady();
+    const netReady = await waitForAppNet(30000);
+    if (!netReady) {
+      log('WARNING: app.$Net never appeared; tools will report unavailability until login.');
+    }
+    const token = loadOrCreateToken();
+    const server = createMcpServer(token);
+    server.on('error', (e) => {
+      log(`HTTP server error (service disabled): ${e.message}`);
+    });
+    server.listen(PORT, BIND_HOST, () => {
+      log(`MCP service listening on http://${BIND_HOST}:${PORT}/mcp (netReady=${netReady})`);
+      log(`token file: ${tokenPath()}`);
+      log('connect with: claude mcp add --transport http baidupan ' +
+          `http://${BIND_HOST}:${PORT}/mcp --header "Authorization: Bearer ${token}"`);
+      log(`log file: ${logPath()}`);
+    });
+  } catch (e) {
+    log(`startup failed: ${e && e.stack || e}`);
+  }
+}
+
+start();

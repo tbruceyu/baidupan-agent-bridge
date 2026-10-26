@@ -1,0 +1,12 @@
+# Build artifacts and proprietary payloads (never commit)
+BaiduNetdisk_mac*.app
+backup/
+backup-4.52.5/
+build/
+*.log
+
+# Baidu's original package.json (extracted from the client asar)
+package.json
+
+# macOS
+.DS_Store
