@@ -49,7 +49,7 @@ claude mcp add --transport http baidupan http://127.0.0.1:8765/mcp \
 ## 工作原理（v2，适配 8.9.7）
 
 8.9.7 的主进程代码已被 javascript-obfuscator 混淆、app.$xxx 全局对象不复存在，
-v2 改为以下方案（12 个工具与 v1 完全对齐）：
+v2 采用以下方案（12 个工具）：
 
 - 凭证：从 Electron 会话 cookie jar（session.defaultSession 及 Partitions）读取
   .baidu.com 的 BDUSS/BDUSS_BFESS 和 .pan.baidu.com 的 STOKEN，30 秒缓存，
@@ -60,24 +60,18 @@ v2 改为以下方案（12 个工具与 v1 完全对齐）：
   用 Node 原生 https 直接请求，携带 cookie + netdisk UA + Referer
 - 上传：走客户端原生引擎 —— 直接 koffi 加载
   Contents/Frameworks/libbrowserengine.dylib，调用 browser_engine_upload_files，
-  与手动上传共用同一队列/UI/秒传逻辑
+  与手动上传共用同一队列/UI/秒传逻辑（xpan precreate 在 web 会话下返回
+  errno 9019 need verify，因此上传必须走原生引擎）
 - 队列状态：同一 dylib 的 browser_engine_get_task_count
-  （ABI 经反汇编与 4.52.5 比对一致，输出参数用 koffi.inout 声明以回写计数）
+  （输出参数用 koffi.inout 声明以回写计数）
 - 下载：/api/filemetas（web 参数）解析 dlink 后 Node https 流式下载并校验大小
 - mkdir 走旧版 /api/create?a=commit（xpan creates 在 web 会话下报 31296）
 - 状态徽标（v2.1）：主窗口左下角显示 Agent Bridge 状态（绿点 + 账号名 + 传输计数），
   点击展开访问日志面板（最近 200 条，与 agent-bridge.log 同源），再点击收起
 - 服务仅绑定 127.0.0.1，校验 Host 头（防 DNS rebinding）、Content-Type（防 CSRF）、
-  Bearer Token（token 与 v1 复用，Claude Code 注册无需改动）
-
-## 从 4.52.5 升级到 8.9.7 的差异
-
-- 注入点从 dist/electron/main.js（webpack bundle）变为 dist/electron/entry.js
-  （混淆后的入口，文件末尾追加 require 即可）
-- unpacked 目录集合更新（@baidu 等 native 模块），见 build.sh
-- 上传/队列不再依赖 app.$uploader，改为直接 FFI 调用引擎 dylib
-- xpan precreate 上传在 web 会话下返回 errno 9019（need verify），
-  因此上传必须走原生引擎
+  Bearer Token
+- 注入点：混淆后的 dist/electron/entry.js 文件末尾追加 require；
+  unpacked 目录集合（@baidu 等 native 模块）见 build.sh
 
 ## 注意事项
 
@@ -85,4 +79,3 @@ v2 改为以下方案（12 个工具与 v1 完全对齐）：
   手动升级/重装客户端后：把新版 app 放到工程目录，删掉 backup/ 重新执行 ./build.sh
 - 未登录时所有工具返回明确提示，登录客户端后即可使用
 - 排查问题先看日志：~/Library/Application Support/baidunetdisk/agent-bridge.log
-- 回滚到 4.52.5：BaiduNetdisk_mac-4.52.5-bridged.app（确认不再需要后可删除，约 1.1GB）

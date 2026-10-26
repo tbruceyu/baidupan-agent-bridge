@@ -1,7 +1,6 @@
 # Build artifacts and proprietary payloads (never commit)
 BaiduNetdisk_mac*.app
-backup/
-backup-4.52.5/
+backup*/
 build/
 *.log
 

@@ -11,7 +11,7 @@
 
 | 目录 | 说明 |
 |---|---|
-| `agent-bridge/` | 注入模块源码 + 一键构建/回滚脚本（v2.1.0，适配客户端 8.9.7+，含 `agent-bridge-4.52.5.js.bak` 旧版客户端适配源码） |
+| `agent-bridge/` | 注入模块源码 + 一键构建/回滚脚本（v2.1.0，适配客户端 8.9.7+） |
 | `skill/baidu-netdisk/` | Agent skill / CLI 封装层（任何 agent 可用，不限于 Claude Code） |
 
 ## 快速开始

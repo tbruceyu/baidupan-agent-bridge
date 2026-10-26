@@ -6,8 +6,8 @@
  * local agents (e.g. Claude Code) through an MCP Streamable HTTP endpoint
  * bound to 127.0.0.1:8765/mcp.
  *
- * v2 changes vs the 4.52.5 bridge (the client removed the app.$xxx globals
- * and obfuscated its bootstrap in 8.9.7):
+ * Key design points (the client obfuscates its bootstrap and has no
+ * app.$xxx globals):
  *   - Credentials come from the Chromium session cookie jar (BDUSS/BDUSS_BFESS
  *     + STOKEN of the logged-in client session) instead of app.$Net.
  *   - All pan.baidu.com REST calls go through plain Node https with those
