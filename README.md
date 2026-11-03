@@ -11,7 +11,7 @@
 
 | 目录 | 说明 |
 |---|---|
-| `agent-bridge/` | 注入模块源码 + 一键构建/回滚脚本（v2.1.0，适配客户端 8.9.7+） |
+| `agent-bridge/` | 注入模块源码 + 一键构建/回滚脚本（v2.1.0，仅适配客户端 [8.9.7](https://a2087d-2029999431.antpcdn.com:19001/b/pkg-ant.baidu.com/issue/netdisk/MACguanjia/8.9.7/BaiduNetdisk_mac_8.9.7_arm64.dmg)） |
 | `skill/baidu-netdisk/` | Agent skill / CLI 封装层（任何 agent 可用，不限于 Claude Code） |
 
 ## 快速开始
