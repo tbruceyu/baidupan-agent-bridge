@@ -6,7 +6,7 @@
 ## 组成
 
 - `agent-bridge.js` — 注入模块（零外部依赖），在主进程内启动 MCP Streamable HTTP 服务
-- `build.sh` — 备份 → 解包 → 注入 → 重打包 → ad-hoc 重签名，一键完成
+- `build.sh` — 备份 → 解包 → 注入 → 重打包 → ad-hoc 重签名 → 安装 skill，一键完成
 - `restore.sh` — 从备份恢复原始 `app.asar`
 
 ## 构建
@@ -21,16 +21,33 @@ cd agent-bridge
 （混淆入口 `dist/electron/entry.js`），不匹配则拒绝注入；
 已注入过但缺少原始备份时也会拒绝（无法重建干净的 asar）。
 
-构建完成后启动 `/Applications/BaiduNetdisk_mac.app`（必须处于登录状态），
-服务监听 `http://127.0.0.1:8765/mcp`。
+构建完成后，skill 会自动安装到 `~/.agents/skills/baidu-netdisk-assistant/`，并在
+Claude Code、Gemini CLI、Cursor 和 OpenCode 的 skill 目录中建立符号链接。
+启动 `/Applications/BaiduNetdisk_mac.app` 并登录后，推荐直接使用 skill：
 
-## Claude Code 接入
+```bash
+~/.agents/skills/baidu-netdisk-assistant/scripts/baidupan.sh status
+```
+
+客户端以后升级、重装或注入失效时，也可以直接通过 skill 重新安装：
+
+```bash
+~/.agents/skills/baidu-netdisk-assistant/scripts/baidupan.sh install --yes
+```
+
+该命令会使用原安装源码；独立分发的 skill 则会在用户目录持久缓存 GitHub 源码，
+保留原始 asar 备份，然后自动退出客户端、注入、重启并运行状态验证。
+
+## 可选：MCP 接入
+
+我们主推 skill；需要原生 MCP 工具注册的客户端也可以并行安装 MCP：
 
 ```bash
 claude mcp add --transport http baidupan http://127.0.0.1:8765/mcp \
   --header "Authorization: Bearer $(cat ~/Library/Application\ Support/baidunetdisk/agent-bridge-token)"
 ```
 
+- MCP 服务监听 `http://127.0.0.1:8765/mcp`
 - Token 首次启动时自动生成，位于 `~/Library/Application Support/baidunetdisk/agent-bridge-token`
 - 日志：`~/Library/Application Support/baidunetdisk/agent-bridge.log`（含可直接复制的接入命令）
 

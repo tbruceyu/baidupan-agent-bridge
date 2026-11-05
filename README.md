@@ -12,25 +12,31 @@
 | 目录 | 说明 |
 |---|---|
 | `agent-bridge/` | 注入模块源码 + 一键构建/回滚脚本（v2.1.0，仅适配客户端 [8.9.7](https://a2087d-2029999431.antpcdn.com:19001/b/pkg-ant.baidu.com/issue/netdisk/MACguanjia/8.9.7/BaiduNetdisk_mac_8.9.7_arm64.dmg)） |
-| `skill/baidu-netdisk/` | Agent skill / CLI 封装层（任何 agent 可用，不限于 Claude Code） |
+| `skill/baidu-netdisk-assistant/` | **百度云盘助手** Agent Skill / CLI 封装层（任何 agent 可用，不限于 Claude Code） |
+
+`build.sh` 会把“百度云盘助手”skill 安装到跨 agent 的标准目录
+`~/.agents/skills/baidu-netdisk-assistant/`，并为 Claude Code、Gemini CLI、Cursor 和
+OpenCode 建立各自 skill 目录下的符号链接。**推荐使用 skill**；MCP 接入仍然支持，
+适合希望直接注册原生 MCP 工具的客户端。安装后的 skill 也内置安装器，客户端升级、
+重装或注入失效后可让 agent 运行 `baidupan.sh install --yes` 自动重新注入并验证。
 
 ## 快速开始
 
 ```bash
 # 1) 确认官方客户端已安装在 /Applications/BaiduNetdisk_mac.app（8.9.7+，
 #    build.sh 会先校验版本与 asar 布局再注入）
-# 2) 注入（会自动备份原始 asar 到 backup/）
+# 2) 注入并自动安装 skill（会自动备份原始 asar 到 backup/）
 cd agent-bridge && ./build.sh
 
 # 3) 启动客户端并登录
 open /Applications/BaiduNetdisk_mac.app
 
-# 4) Claude Code 接入（MCP）
+# 4) 推荐：任何兼容 Agent Skills 的 agent 直接使用 skill/CLI
+~/.agents/skills/baidu-netdisk-assistant/scripts/baidupan.sh status
+
+# 可选：也可以为原生 MCP 客户端安装 MCP 配置
 claude mcp add --transport http baidupan http://127.0.0.1:8765/mcp \
   --header "Authorization: Bearer $(cat ~/Library/Application\ Support/baidunetdisk/agent-bridge-token)"
-
-# 或者：任何 agent 走 skill/CLI
-~/.agents/skills/baidu-netdisk/scripts/baidupan.sh status
 ```
 
 ## 能力（12 个工具）

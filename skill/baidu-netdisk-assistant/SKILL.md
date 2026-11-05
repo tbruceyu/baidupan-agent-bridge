@@ -1,25 +1,55 @@
 ---
-name: baidu-netdisk
-version: 2.0.0
-description: "百度网盘（Baidu Netdisk）本地操作：查看登录态与配额、浏览/搜索云端文件、上传、下载、新建文件夹、重命名、移动、删除（进回收站）、创建分享链接、查询上传下载队列。当用户提到百度网盘、网盘、云盘、pan.baidu.com、上传/下载/整理/分享云盘文件时使用。底层通过注入本地百度网盘 macOS 客户端的 MCP bridge 操作当前登录账号。"
+name: baidu-netdisk-assistant
+version: 2.2.0
+description: "百度云盘助手：百度网盘（Baidu Netdisk）的本地集成、安装与操作。可自动安装/更新 skill、向 macOS 客户端注入 Bridge，并查看登录态与配额、浏览/搜索云端文件、上传、下载、新建文件夹、重命名、移动、删除（进回收站）、创建分享链接、查询上传下载队列。当用户提到安装/更新百度网盘 skill 或 Bridge，以及百度网盘、百度云盘、网盘、云盘、pan.baidu.com、上传/下载/整理/分享云盘文件时使用。"
 metadata:
   requires:
     bins: ["curl", "python3"]
   cliHelp: "baidupan.sh help"
 ---
 
-# baidu-netdisk (v2)
+# 百度云盘助手（baidu-netdisk-assistant）
 
 通过本地百度网盘 macOS 客户端内注入的 MCP bridge，操作当前登录账号的网盘文件。
 所有操作经由本 skill 的 CLI 脚本完成：
 
 ```bash
-~/.agents/skills/baidu-netdisk/scripts/baidupan.sh <command> [args...]
+~/.agents/skills/baidu-netdisk-assistant/scripts/baidupan.sh <command> [args...]
 ```
 
 （下文简写为 `baidupan.sh`）
 
-## 前置条件（重要）
+## 安装或更新 Bridge
+
+当用户要求安装、更新、重新注入，或客户端运行但 Bridge 无响应时，使用：
+
+```bash
+~/.agents/skills/baidu-netdisk-assistant/scripts/baidupan.sh install --yes
+```
+
+安装器会依次执行：
+
+1. 检查 macOS 和 `/Applications/BaiduNetdisk_mac.app`（可用 `--app PATH` 覆盖）。
+2. 优先使用当前仓库源码；独立安装的 skill 会从
+   `https://github.com/tbruceyu/baidupan-agent-bridge.git` 获取最新源码。
+3. 正常退出正在运行的客户端，校验版本与 asar 布局，备份原始 asar。
+4. 注入并 ad-hoc 重签名客户端，同时禁用会覆盖注入的自动更新。
+5. 安装/更新 `~/.agents/skills/baidu-netdisk-assistant` 及其他 agent 的符号链接。
+6. 重新启动客户端并运行只读 `status` 验证。
+
+此操作会修改已安装的应用、退出正在运行的客户端并禁用客户端自动更新，属于
+需要用户明确同意的操作。用户已经明确要求安装/更新时可传 `--yes`；否则先说明
+这些影响并取得确认。不要在可能有传输任务进行时擅自退出客户端。其他选项：
+
+```bash
+baidupan.sh install --help
+baidupan.sh install --yes --no-launch
+baidupan.sh install --yes --app /path/to/BaiduNetdisk_mac.app
+```
+
+我们主推 skill；原生 MCP 注册是可选项，不是安装的必要步骤。
+
+## 使用前提（重要）
 
 1. **客户端必须运行且已登录**。正常启动已安装的客户端即可
    （如 `open /Applications/BaiduNetdisk_mac.app`，或从启动台/Spotlight 打开）。
@@ -29,10 +59,11 @@ metadata:
 3. Token 位于 `~/Library/Application Support/baidunetdisk/agent-bridge-token`，
    脚本自动读取，无需手动传。
 
-## 命令一览（12 个，对应全部 bridge 能力）
+## 命令一览
 
 | 命令 | 说明 |
 |---|---|
+| `install [options]` | 安装/更新 Bridge 与 skill；用 `install --help` 查看选项 |
 | `status` | 登录态 / 账号信息 / 配额 |
 | `quota` | 存储配额 |
 | `list [dir] [start] [limit]` | 列目录，默认 `/` 0 100 |
@@ -76,7 +107,7 @@ baidupan.sh share /工作备份/报告.pdf         # 或 share <path> abcd 7
 
 | 现象 | 处理 |
 |---|---|
-| 连接被拒 | 先 `baidupan.sh status` 看提示：客户端没运行就启动它并登录后重试；提示已运行但 bridge 无响应，说明当前安装的客户端未注入（重装/升级过），需用仓库里的 `agent-bridge/build.sh` 重新注入 |
+| 连接被拒 | 先 `baidupan.sh status` 看提示：客户端没运行就启动它并登录后重试；提示已运行但 Bridge 无响应，说明客户端可能未注入或被升级覆盖，经用户确认后运行 `baidupan.sh install --yes` 重新安装 |
 | 提示未登录 | 在客户端 UI 里登录，凭证会自动跟随（30 秒缓存） |
 | 上传长时间不动 | 先 `baidupan.sh transfers` 看 failed 计数；本地文件是否被移动 |
 | 其他 | 看日志：`~/Library/Application Support/baidunetdisk/agent-bridge.log` |

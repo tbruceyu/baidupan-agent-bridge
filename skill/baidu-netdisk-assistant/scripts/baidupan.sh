@@ -106,6 +106,7 @@ usage() {
 baidupan.sh — operate Baidu Netdisk via the local MCP bridge
 
 Usage:
+  baidupan.sh install [installer options]     install/update bridge and skill
   baidupan.sh status                          login state / account / quota
   baidupan.sh quota                           storage quota
   baidupan.sh list [dir] [start] [limit]      list a directory (default "/" 0 100)
@@ -127,6 +128,7 @@ EOF
 cmd="$1"; shift
 
 case "$cmd" in
+  install)   exec "$(cd "$(dirname "$0")" && pwd)/install.sh" "$@" ;;
   status)    mcpcall baidu_status "$(json_dump)" ;;
   quota)     mcpcall baidu_get_quota "$(json_dump)" ;;
   transfers) mcpcall baidu_transfer_status "$(json_dump)" ;;

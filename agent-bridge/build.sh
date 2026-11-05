@@ -7,8 +7,8 @@
 # already injected.
 #
 # Flow: (re)create pristine extraction from the original backup asar,
-# add the bridge module, append a require to entry.js, repack with the
-# same unpacked set, reinstall into the .app and re-sign (ad-hoc).
+# add the bridge module, append a require to entry.js, repack with the same
+# unpacked set, reinstall into the .app, re-sign (ad-hoc), and install the skill.
 #
 # Toolchain note: this machine's `node`/`npx` shell functions are broken nvm
 # shims in non-interactive shells, so we use absolute homebrew paths.
@@ -33,6 +33,70 @@ MIN_VERSION="8.9.7"
 # alternative matches); the library API handles them correctly, so packing
 # goes through a small node script that imports @electron/asar directly.
 UNPACK_DIR_GLOB='node_modules/{@baidu,electron-clipboard-ex,koffi,macos-notification-state,uiohook-napi,windows-notification-state,windows-quiet-hours}'
+SKILL_SOURCE="$PROJECT_DIR/skill/baidu-netdisk-assistant"
+SKILL_INSTALL_DIR="$HOME/.agents/skills/baidu-netdisk-assistant"
+OLD_SKILL_INSTALL_DIR="$HOME/.agents/skills/baidu-netdisk"
+
+# Install the Agent Skill in the cross-agent canonical location, then expose it
+# to agents that use their own skill directory. Existing non-symlink entries at
+# link locations are preserved as timestamped backups.
+install_skill() {
+  echo "==> Installing 百度云盘助手 skill (baidu-netdisk-assistant)"
+  [ -f "$SKILL_SOURCE/SKILL.md" ] || {
+    echo "ERROR: skill source not found at $SKILL_SOURCE" >&2
+    exit 1
+  }
+
+  mkdir -p "$(dirname "$SKILL_INSTALL_DIR")"
+  SKILL_STAGE="$(mktemp -d "$(dirname "$SKILL_INSTALL_DIR")/.baidu-netdisk-assistant.XXXXXX")"
+  cp -R "$SKILL_SOURCE/." "$SKILL_STAGE/"
+  # Keep the matching source checkout discoverable for future skill-driven
+  # updates. A downloaded installer uses a persistent checkout so its pristine
+  # asar backup remains available across runs.
+  printf '%s\n' "$PROJECT_DIR" > "$SKILL_STAGE/.source-repo"
+  rm -rf "$SKILL_INSTALL_DIR"
+  mv "$SKILL_STAGE" "$SKILL_INSTALL_DIR"
+  echo "    installed -> $SKILL_INSTALL_DIR"
+
+  AGENT_SKILL_DIRS=(
+    "$HOME/.claude/skills"
+    "$HOME/.gemini/skills"
+    "$HOME/.cursor/skills"
+    "$HOME/.config/opencode/skills"
+  )
+  AGENT_NAMES=("Claude Code" "Gemini CLI" "Cursor" "OpenCode")
+
+  i=0
+  while [ "$i" -lt "${#AGENT_SKILL_DIRS[@]}" ]; do
+    agent_dir="${AGENT_SKILL_DIRS[$i]}"
+    link="$agent_dir/baidu-netdisk-assistant"
+    mkdir -p "$agent_dir"
+    if [ -L "$link" ]; then
+      rm "$link"
+    elif [ -e "$link" ]; then
+      backup="$link.backup-$(date +%Y%m%d%H%M%S)-$$"
+      mv "$link" "$backup"
+      echo "    preserved existing ${AGENT_NAMES[$i]} skill -> $backup"
+    fi
+    ln -s "$SKILL_INSTALL_DIR" "$link"
+    echo "    linked ${AGENT_NAMES[$i]} -> $link"
+
+    old_link="$agent_dir/baidu-netdisk"
+    if [ -L "$old_link" ]; then
+      rm "$old_link"
+      echo "    removed old ${AGENT_NAMES[$i]} link -> $old_link"
+    fi
+    i=$((i + 1))
+  done
+
+  # Migrate installations created before the skill was renamed. Only remove the
+  # old canonical directory when it identifies itself as our former package.
+  if [ -f "$OLD_SKILL_INSTALL_DIR/SKILL.md" ] \
+    && grep -q '^name: baidu-netdisk$' "$OLD_SKILL_INSTALL_DIR/SKILL.md"; then
+    rm -rf "$OLD_SKILL_INSTALL_DIR"
+    echo "    removed old skill package -> $OLD_SKILL_INSTALL_DIR"
+  fi
+}
 
 # version_ge <installed> <required> — dotted-numeric semver compare.
 version_ge() {
@@ -208,6 +272,14 @@ mv "$APP" "$OLD_APP"
 mv "$NEW_APP" "$APP"
 rm -rf "$OLD_APP"
 
+install_skill
+
 echo "==> Done."
-echo "    Start the app, then connect an MCP client to http://127.0.0.1:8765/mcp"
+echo "    Start the app and sign in, then use the recommended skill:"
+echo "      ~/.agents/skills/baidu-netdisk-assistant/scripts/baidupan.sh status"
+echo ""
+echo "    Optional: native MCP clients can also connect to the bridge:"
+echo '      claude mcp add --transport http baidupan http://127.0.0.1:8765/mcp \'
+echo '        --header "Authorization: Bearer $(cat ~/Library/Application\ Support/baidunetdisk/agent-bridge-token)"'
+echo "    Skill is the recommended integration; MCP is optional."
 echo "    Token file: ~/Library/Application Support/baidunetdisk/agent-bridge-token"
